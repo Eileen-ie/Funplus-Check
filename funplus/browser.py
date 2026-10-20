@@ -214,12 +214,18 @@ async def click_claim_buttons(page: Page) -> List[str]:
     claimed: List[str] = []
     await page.goto(f"{ZONE_BASE}/benefits/pointstask", wait_until="domcontentloaded")
     await page.wait_for_timeout(3000)
-    buttons = page.get_by_role("button", name=re.compile(r"领取|Claim|領取", re.I))
+    buttons = page.get_by_role("button", name=re.compile(r"^(领取|領取|Claim)$", re.I))
     count = await buttons.count()
     for i in range(count):
         btn = buttons.nth(i)
         try:
-            name = (await btn.inner_text()).strip()
+            if not await btn.is_visible(timeout=1500):
+                continue
+            if not await btn.is_enabled(timeout=1500):
+                continue
+            name = (await btn.inner_text(timeout=1500)).strip()
+            if re.search(r"已[领取領取]|补领|補領|Claimed", name, re.I):
+                continue
             await btn.click(timeout=3000)
             await page.wait_for_timeout(1200)
             claimed.append(name or f"button-{i+1}")
@@ -245,9 +251,9 @@ async def claim_benefit_packs(page: Page) -> List[str]:
         for i in range(count):
             btn = buttons.nth(i)
             try:
-                if not await btn.is_enabled():
+                if not await btn.is_enabled(timeout=2000):
                     continue
-                label = (await btn.inner_text()).strip()
+                label = (await btn.inner_text(timeout=2000)).strip()
                 if not label or skip_pattern.search(label):
                     continue
                 await btn.click(timeout=4000)

@@ -12,6 +12,11 @@ import requests
 
 API_BASE = "https://zone-api.funplus.com/api/"
 ZONE_ORIGIN = "https://zone.funplus.com"
+# Tiles Survive 福利中心（store 7 日赠礼）。只允许查询和免费领取。
+STORE_AME_DO = "https://ame-ts.funplus.com/do"
+STORE_SIGNIN_P1 = 187
+STORE_SIGNIN_LIST = "2926,3617"
+STORE_SIGNIN_CLAIM = "2926,3618"
 DEFAULT_BASENAME = "/tilessurvive"
 DEFAULT_GAME_PROJECT = "ts_global"
 USER_AGENT = (
@@ -149,6 +154,7 @@ class FunplusClient:
     uid: str = ""
     game_id: str = ""
     fp_uid: str = ""
+    open_id: str = ""
     session: requests.Session = field(default_factory=requests.Session)
 
     def __post_init__(self) -> None:
@@ -207,6 +213,8 @@ class FunplusClient:
                 self.game_id = str(inner.get("game_id"))
             if inner.get("fp_uid"):
                 self.fp_uid = str(inner.get("fp_uid"))
+            if inner.get("open_id"):
+                self.open_id = str(inner.get("open_id"))
             self._sync_priv_headers()
             return inner if isinstance(inner, dict) else data
         return {}
@@ -330,6 +338,44 @@ class FunplusClient:
 
     def vip_rights_get(self, rights_key: str) -> Dict[str, Any]:
         return self.post("vip/rights_get", {"rights_key": rights_key})
+
+    def _store_ame(self, p2: str, day: Optional[int] = None) -> Dict[str, Any]:
+        """GET ame-ts /do for the 7-day gift. p2 is restricted to list/free-claim."""
+        if p2 not in (STORE_SIGNIN_LIST, STORE_SIGNIN_CLAIM):
+            raise RuntimeError(f"拒绝调用福利中心接口 {p2}（只允许查询和免费领取）")
+        if day is not None and p2 != STORE_SIGNIN_CLAIM:
+            raise RuntimeError("只有免费领取可以带 day")
+        if not self.open_id or not self.uid:
+            self.user_info()
+        params: Dict[str, Any] = {
+            "p0": "web",
+            "p1": STORE_SIGNIN_P1,
+            "p2": p2,
+            "game": "ts",
+            "game_id": int(self.game_id or 8612),
+            "game_project": self.game_project or DEFAULT_GAME_PROJECT,
+            "source": "web_private",
+            "openid": self.open_id,
+            "uid": self.uid,
+        }
+        if day is not None:
+            params["day"] = int(day)
+        response = self.session.get(STORE_AME_DO, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return {"code": -1, "msg": "invalid response", "data": payload}
+        return payload
+
+    def store_week_gift_list(self) -> Dict[str, Any]:
+        """7日赠礼状态。不会领取，也不会补领。"""
+        result = self._store_ame(STORE_SIGNIN_LIST)
+        data = result.get("data") if result.get("code") in (0, "0") else {}
+        return data if isinstance(data, dict) else {}
+
+    def store_week_gift_claim(self, day: int) -> Dict[str, Any]:
+        """免费领取指定天数。调用方必须先确认 status == claimable。"""
+        return self._store_ame(STORE_SIGNIN_CLAIM, day=int(day))
 
 
 def _gift_items_from_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:

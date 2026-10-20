@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,13 +33,23 @@ from funplus.client import (
     gift_display_name,
     load_auth_payload,
     member_gift_id,
-    needs_goto,
     parse_cookie_string,
 )
 from funplus.notify import push_plus
 
 SIGNIN_KEYWORDS = ("签到", "簽到", "sign-in", "signin", "sign in", "專區簽到", "专区签到")
-PURCHASE_KEYWORDS = ("储值", "儲值", "支付", "purchase", "top-up", "topup", "充值", "商城支付")
+PURCHASE_KEYWORDS = (
+    "储值",
+    "儲值",
+    "支付",
+    "purchase",
+    "top-up",
+    "topup",
+    "充值",
+    "商城支付",
+    "place 1 order",
+    "order(s) at the store",
+)
 VISIT_KEYWORDS = ("帖子", "瀏覽", "浏览", "visit", "read", "posts", "查看")
 EXCHANGE_TASK_KEYWORDS = (
     "积分商城",
@@ -283,16 +294,144 @@ def summarize_tasks(tasks: List[Dict[str, Any]]) -> str:
     for task in tasks:
         name = _task_name(task)
         progress = f"{task.get('now_progress')}/{task.get('progress')}"
+        cycle = f"{task.get('now_times_in_cycle')}/{task.get('times_in_cycle')}"
         state = (
             "可领取"
             if can_claim_task(task)
-            else ("已完成" if (not needs_goto(task)) else "进行中/需前往")
+            else ("已完成" if task_cycle_done(task) else "进行中/需前往")
         )
         lines.append(
-            f"- [{task.get('_category')}] {name} | {progress} | "
-            f"get_times={task.get('get_times')} | {state}"
+            f"- [{task.get('_category')}] {name} | 进度 {progress} | "
+            f"周期 {cycle} | get_times={task.get('get_times')} | {state}"
         )
     return "\n".join(lines) if lines else "- （无任务）"
+
+
+def task_cycle_done(task: Dict[str, Any]) -> bool:
+    """周期次数已满，并且没有待点的领取次数。"""
+    times = _as_int(task.get("times_in_cycle"))
+    now = _as_int(task.get("now_times_in_cycle"))
+    return times > 0 and now >= times and _as_int(task.get("get_times")) == 0
+
+
+def is_free_daily_task(task: Dict[str, Any]) -> bool:
+    """专区签到、浏览帖子、积分商城兑换。不含需要真实付款的商城下单。"""
+    return _match(task, SIGNIN_KEYWORDS + VISIT_KEYWORDS + EXCHANGE_TASK_KEYWORDS)
+
+
+def settle_free_tasks(client: FunplusClient) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    签到、浏览、兑换之后，任务进度经常晚几秒才写上。
+    第一轮就轮询领取，直到免费任务的周期次数满，或等待结束。
+    """
+    lines: List[str] = []
+    tasks: List[Dict[str, Any]] = []
+    pauses = (0, 6, 10, 15, 20, 25, 30, 30)
+    for index, pause in enumerate(pauses, start=1):
+        if pause:
+            time.sleep(pause)
+        tasks = collect_tasks(client)
+        claimed = claim_ready_tasks(client, tasks)
+        if claimed:
+            lines.append(f"第 {index} 轮领取：")
+            lines.extend(claimed)
+            tasks = collect_tasks(client)
+        pending = [task for task in tasks if is_free_daily_task(task) and not task_cycle_done(task)]
+        if not pending:
+            lines.append("免费每日任务已完成：专区签到、浏览帖子、积分商城兑换")
+            break
+        names = "、".join(_task_name(task) for task in pending)
+        print(f"免费任务尚未写完进度（第 {index} 轮）：{names}")
+    else:
+        still = [task for task in tasks if is_free_daily_task(task) and not task_cycle_done(task)]
+        if still:
+            lines.append("免费任务在本轮结束时仍未完成：")
+            for task in still:
+                lines.append(
+                    f"- {_task_name(task)} "
+                    f"{task.get('now_progress')}/{task.get('progress')} "
+                    f"周期 {task.get('now_times_in_cycle')}/{task.get('times_in_cycle')}"
+                )
+    return lines, tasks
+
+
+def _reward_label(reward: Dict[str, Any]) -> str:
+    items = reward.get("items") or []
+    first = items[0] if items and isinstance(items[0], dict) else {}
+    name = str(first.get("item_name") or first.get("item_id") or "奖励")
+    num = first.get("num") or ""
+    day = reward.get("day")
+    return f"第{day}天 {name} x{num}".strip()
+
+
+def claim_store_week_gifts(client: FunplusClient) -> List[str]:
+    """
+    福利中心 7 日赠礼：只领取 status=claimable 的免费按钮。
+    不调用补领（2926,3619，扣 1 积分），也不调用页面上的积分兑换。
+    周一到周日一轮，过期后再从第 1 天开始；脚本每次只领当前可免费领的那一天。
+    """
+    lines: List[str] = []
+    try:
+        data = client.store_week_gift_list()
+    except Exception as exc:
+        return [f"7日赠礼：查询失败 {exc}"]
+
+    rewards = data.get("rewards") if isinstance(data, dict) else None
+    if not isinstance(rewards, list) or not rewards:
+        return ["7日赠礼：没有读到本周奖励列表"]
+
+    week_day = data.get("week_day")
+    cycle = data.get("qualification_cycle") or ""
+    lines.append(f"7日赠礼：本周周期 {cycle}，week_day={week_day}")
+    claimable: List[Dict[str, Any]] = []
+    for reward in rewards:
+        if not isinstance(reward, dict):
+            continue
+        status = str(reward.get("status") or "").lower()
+        label = _reward_label(reward)
+        if status == "claimable":
+            claimable.append(reward)
+            lines.append(f"- {label} 可免费领取")
+        elif status == "makeup":
+            lines.append(f"- {label} 是补领，跳过（补领会扣 1 积分）")
+        elif status == "claimed":
+            lines.append(f"- {label} 已领取")
+        else:
+            lines.append(f"- {label} 状态 {status or '未知'}，不操作")
+
+    if not claimable:
+        lines.append("7日赠礼：今天没有可免费领取的按钮")
+        return lines
+
+    for reward in claimable:
+        day = _as_int(reward.get("day"))
+        label = _reward_label(reward)
+        if day <= 0:
+            lines.append(f"7日赠礼：跳过无效天数 {label}")
+            continue
+        result = client.store_week_gift_claim(day)
+        code = result.get("code")
+        msg = result.get("message") or result.get("msg") or ""
+        if code not in (0, "0"):
+            lines.append(f"7日赠礼：领取失败 {label} code={code} msg={msg}")
+            continue
+        lines.append(f"7日赠礼：领取成功 {label}")
+
+    try:
+        confirmed = client.store_week_gift_list()
+    except Exception as exc:
+        lines.append(f"7日赠礼：领取后复核失败 {exc}")
+        return lines
+
+    still = []
+    for reward in confirmed.get("rewards") or []:
+        if isinstance(reward, dict) and str(reward.get("status") or "").lower() == "claimable":
+            still.append(_reward_label(reward))
+    if still:
+        lines.append("7日赠礼：复核后仍可领取 " + "、".join(still))
+    else:
+        lines.append("7日赠礼：复核通过，当前没有未领的免费按钮")
+    return lines
 
 
 def _product_item_blob(product: Dict[str, Any]) -> str:
@@ -534,6 +673,9 @@ def run() -> int:
         )
         lines.append(f"用户：{nickname} uid={client.uid or user.get('uid')}")
 
+        # 福利中心 7 日赠礼：只点免费领取，不碰补领和积分兑换。
+        lines.extend(claim_store_week_gifts(client))
+
         lines.append(do_monthly_signin(client))
         lines.append(do_weekly_signin(client))
 
@@ -541,39 +683,36 @@ def run() -> int:
         # cycle_now_times>=1 makes a second daily run skip buying.
         lines.append(exchange_daily_supply_crate(client))
 
-        tasks = collect_tasks(client)
+        # 进度写入有延迟。第一轮就轮询，把可领的免费任务全部点掉。
+        settle_lines, tasks_after = settle_free_tasks(client)
+        lines.append("任务结算：")
+        lines.extend(settle_lines)
         lines.append("任务列表：")
-        lines.append(summarize_tasks(tasks))
-
-        # Prefer claiming all claimable tasks to maximize points
-        claim_lines = claim_ready_tasks(client, tasks)
-        if claim_lines:
-            lines.extend(claim_lines)
-        else:
-            lines.append("任务领取：当前没有可领取任务")
-
-        # Re-fetch after browse + exchange + claims
-        tasks_after = collect_tasks(client)
-        still_claimable = claim_ready_tasks(client, tasks_after)
-        if still_claimable:
-            lines.append("二次领取：")
-            lines.extend(still_claimable)
+        lines.append(summarize_tasks(tasks_after))
 
         lines.extend(claim_member_gifts(client, vip_level=_as_int(user.get("vip_level"))))
 
-        # Hint unfinished goto tasks
-        unfinished = [
+        missed_free = [
             _task_name(t)
             for t in tasks_after
-            if needs_goto(t)
-            and _match(
-                t,
-                SIGNIN_KEYWORDS + PURCHASE_KEYWORDS + VISIT_KEYWORDS + EXCHANGE_TASK_KEYWORDS,
-            )
+            if is_free_daily_task(t) and not task_cycle_done(t)
         ]
-        if unfinished:
-            lines.append("仍需手动完成/未达成条件：")
-            for name in unfinished:
+        if missed_free:
+            ok = False
+            lines.append("免费任务积分未拿满：")
+            for name in missed_free:
+                lines.append(f"- {name}")
+
+        paid_store = [
+            _task_name(t)
+            for t in tasks_after
+            if _match(t, PURCHASE_KEYWORDS)
+            and not is_free_daily_task(t)
+            and not task_cycle_done(t)
+        ]
+        if paid_store:
+            lines.append("商城支付需要真实下单，脚本不会付款，这项保持未完成：")
+            for name in paid_store:
                 lines.append(f"- {name}")
 
     except Exception as exc:

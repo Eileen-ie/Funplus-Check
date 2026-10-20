@@ -100,7 +100,8 @@ When login expires (days or weeks later), run **`refresh_auth.bat`** or **`expor
 2. **Task center** (`/benefits/pointstask`) — claim completed tasks (e.g. game-zone sign-in)  
 3. **Community** — browse 5 posts when logged in, then claim related tasks  
 4. **Member packs** (`/benefits/pack`) — daily check for **weekly**, **level**, and other **free** packs (skips if already claimed)  
-5. **Points mall** (`/benefits/integral`) — exchange the **2-point 10K Supply Crate once per day**, then claim「Exchange once in Points Mall」(+10)
+5. **Points mall** (`/benefits/integral`) — exchange the **2-point 10K Supply Crate once per day**, then claim「Exchange once in Points Mall」(+10)  
+6. **7-day gift** (`store.funplus.com/.../funpluszone/`) — claim the current day's **free** button only. Missed days that cost 1 point, and every points exchange on that page, are left untouched. The week runs Monday–Sunday and then resets.
 
 Inspired by [SJS-Check](https://github.com/LiJT/SJS-Check): scheduled GitHub Actions + session secret.
 
@@ -177,9 +178,10 @@ python main.py
 | Task center | `task/task_list` → `task/get` when `get_times > 0` |
 | Browse posts | Playwright opens community article pages, then claims |
 | Member packs `benefits/pack` | `GET member_gift/list` + `list_grouped` → `member_gift/receive` (weekly/level packs; daily run, skips claimed) |
-| Points mall `benefits/integral` | Find 10K Supply Crate (`shop/product_list`) → buy once if `cycle_now_times==0` (`shop/buy`) → then claim mall-exchange task |
+| Points mall `benefits/integral` | Find 10K Supply Crate (`shop/product_list`) → buy once if `cycle_now_times==0` (`shop/buy`) → then poll and claim the mall-exchange task |
+| 7-day gift `funpluszone` | List the week → claim only `status=claimable`. Never makeup (1 point) and never the page's point exchange |
 
-“Place 1 store order” only becomes claimable after a **real** purchase; the script only **claims** rewards, it does not spend money or points.
+The first run signs in, browses, exchanges the crate once, then keeps checking the task list until the free daily tasks are claimed. The 14:30 run does the same checks again and will not buy the crate a second time. “Place 1 store order” needs a real purchase; the script does not pay for it.
 
 ## FAQ
 
